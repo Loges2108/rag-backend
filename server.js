@@ -15,26 +15,23 @@ const PORT = process.env.PORT || 5000;
 const redisClient = createClient({ url: "redis://127.0.0.1:6379" });
 redisClient.on("error", (err) => console.error("Redis Client Error", err));
 await redisClient.connect();
-console.log("Connected to Redis");
+console.log("✅ Connected to Redis");
 
 app.use(cors());
 app.use(express.json());
 
-// Ingest 50 articles at startup
-(async () => {
-  console.log("Starting article ingestion...");
-  await ingest();
-  console.log("Articles ingested successfully");
-})();
-
-// Create new session
+/**
+ * Create new session
+ */
 app.post("/session", async (req, res) => {
   const id = uuidv4();
   await redisClient.set(`session:${id}`, JSON.stringify([]));
   res.json({ sessionId: id });
 });
 
-// Chat endpoint
+/**
+ * Chat endpoint
+ */
 app.post("/chat", async (req, res) => {
   const { sessionId, message } = req.body;
   const historyRaw = await redisClient.get(`session:${sessionId}`);
@@ -46,23 +43,43 @@ app.post("/chat", async (req, res) => {
     await redisClient.set(`session:${sessionId}`, JSON.stringify(history));
     res.json({ reply: answer });
   } catch (err) {
-    console.error(err);
+    console.error("❌ Chat error:", err.message);
     res.status(500).json({ error: "Failed to get response" });
   }
 });
 
-// Get session history
+/**
+ * Get session history
+ */
 app.get("/history/:id", async (req, res) => {
   const historyRaw = await redisClient.get(`session:${req.params.id}`);
   const history = historyRaw ? JSON.parse(historyRaw) : [];
   res.json(history);
 });
 
-// Clear session
+/**
+ * Clear session
+ */
 app.delete("/session/:id", async (req, res) => {
   await redisClient.del(`session:${req.params.id}`);
   res.json({ status: "cleared" });
 });
 
-// Start server
-app.listen(PORT, () => console.log(`Backend running on port ${PORT}`));
+/**
+ * Start server ONLY after ingestion finishes
+ */
+async function start() {
+  console.log("🚀 Starting article ingestion...");
+  try {
+    await ingest(); // ensures collection is created + filled
+    console.log("✅ Articles ingested successfully");
+  } catch (err) {
+    console.error("❌ Ingestion failed:", err.message);
+  }
+
+  app.listen(PORT, () => {
+    console.log(`✅ Backend running on http://localhost:${PORT}`);
+  });
+}
+
+start();

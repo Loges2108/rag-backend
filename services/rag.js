@@ -1,12 +1,38 @@
+// services/rag.js
 import axios from "axios";
 import { QdrantClient } from "@qdrant/js-client-rest";
+import dotenv from "dotenv";
 
-const qdrant = new QdrantClient({ url: process.env.QDRANT_URL });
+dotenv.config();
+
+const qdrant = new QdrantClient({ url: process.env.QDRANT_URL || "http://127.0.0.1:6333" });
 const COLLECTION_NAME = "news_articles";
 const VECTOR_SIZE = 1024;
 const MAX_HISTORY = 5;
 
-/** Embed query using Jina */
+/**
+ * Ensure collection exists
+ */
+async function ensureCollection() {
+  try {
+    const collections = await qdrant.getCollections();
+    const exists = collections.collections.some((col) => col.name === COLLECTION_NAME);
+
+    if (!exists) {
+      console.log(`⚠️ Collection "${COLLECTION_NAME}" not found. Creating...`);
+      await qdrant.createCollection(COLLECTION_NAME, {
+        vectors: { size: VECTOR_SIZE, distance: "Cosine" },
+      });
+      console.log(`✅ Collection "${COLLECTION_NAME}" created.`);
+    }
+  } catch (err) {
+    console.error("❌ Failed to check/create collection:", err.message);
+  }
+}
+
+/**
+ * Embed query text
+ */
 async function embedQuery(text) {
   const res = await axios.post(
     "https://api.jina.ai/v1/embeddings",
@@ -21,18 +47,25 @@ async function embedQuery(text) {
   return vector;
 }
 
-/** Retrieve top-K similar articles from Qdrant */
+/**
+ * Retrieve top-K documents
+ */
 async function retrieve(vector, topK = 3) {
+  await ensureCollection();
+
   const res = await qdrant.search(COLLECTION_NAME, { vector, limit: topK });
-  return (res.result || []).map(r => r.payload?.text || "");
+
+  return (res.result || []).map((r) => r.payload?.text || "");
 }
 
-/** Call Gemini API with retry & exponential backoff */
+/**
+ * Ask Gemini API
+ */
 async function askGemini(conversation, retries = 5, delay = 1000) {
   const trimmedConversation = conversation.slice(-MAX_HISTORY);
 
   const requestBody = {
-    contents: trimmedConversation.map(msg => ({
+    contents: trimmedConversation.map((msg) => ({
       role: msg.role,
       parts: [{ text: msg.text }],
     })),
@@ -55,39 +88,35 @@ async function askGemini(conversation, retries = 5, delay = 1000) {
       if (!candidate) return "No answer from Gemini.";
 
       const content = candidate.content;
-
       if (content?.parts && Array.isArray(content.parts)) {
-        return content.parts.map(p => p.text).join(" ");
+        return content.parts.map((p) => p.text).join(" ");
       }
-
       return "No answer from Gemini.";
     } catch (err) {
       if (err.response?.status === 503) {
-        console.warn(`503 Service Unavailable. Retrying in ${delay}ms...`);
-        await new Promise(r => setTimeout(r, delay));
+        console.warn(`⚠️ Gemini 503. Retrying in ${delay}ms...`);
+        await new Promise((r) => setTimeout(r, delay));
         delay *= 2;
       } else {
-        console.error("Gemini request failed:", err.message);
+        console.error("❌ Gemini request failed:", err.message);
         throw err;
       }
     }
   }
-
   return "Sorry, the assistant is temporarily unavailable. Please try again later.";
 }
 
-
-
-/** RAG pipeline: fetch context & call Gemini */
+/**
+ * RAG pipeline
+ */
 export async function ragPipeline(userMessage) {
   const vector = await embedQuery(userMessage);
   const contextDocs = await retrieve(vector);
 
   const conversation = [
-    ...contextDocs.map(text => ({ role: "system", text })),
+    ...contextDocs.map((text) => ({ role: "system", text })),
     { role: "user", text: userMessage },
   ];
 
-  const answer = await askGemini(conversation);
-  return answer;
+  return await askGemini(conversation);
 }

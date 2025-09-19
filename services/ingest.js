@@ -1,13 +1,18 @@
+// services/ingest.js
 import Parser from "rss-parser";
 import axios from "axios";
 import { v4 as uuidv4 } from "uuid";
 import { QdrantClient } from "@qdrant/js-client-rest";
+import dotenv from "dotenv";
+
+dotenv.config();
 
 const parser = new Parser();
-const qdrant = new QdrantClient({ url: process.env.QDRANT_URL });
+const qdrant = new QdrantClient({ url: process.env.QDRANT_URL || "http://127.0.0.1:6333" });
+
 const COLLECTION_NAME = "news_articles";
 const VECTOR_SIZE = 1024;
-const MAX_TEXT_LENGTH = 1000; // truncate text/title
+const MAX_TEXT_LENGTH = 1000;
 const MAX_ARRAY_ITEM_LENGTH = 200;
 
 /**
@@ -55,44 +60,53 @@ async function embedWithJina(text) {
   );
 
   const vector = res.data?.data?.[0]?.embedding;
-  if (!vector) throw new Error("No embedding returned from Jina API");
+  if (!vector || vector.length !== VECTOR_SIZE) {
+    throw new Error(`Invalid embedding size: ${vector?.length}`);
+  }
   return vector;
 }
 
 /**
- * Reset and create collection
+ * Ensure collection exists
  */
-async function resetCollection() {
+async function ensureCollection() {
   try {
-    await qdrant.deleteCollection(COLLECTION_NAME);
-    console.log(`Deleted old collection "${COLLECTION_NAME}"`);
-  } catch (err) {
-    if (!err.message.includes("not found")) {
-      console.error("Failed to delete collection:", err.message);
-      return false;
-    }
-  }
+    const collections = await qdrant.getCollections();
+    const exists = collections.collections.some((col) => col.name === COLLECTION_NAME);
 
-  try {
-    await qdrant.createCollection(COLLECTION_NAME, {
-      vectors: { size: VECTOR_SIZE, distance: "Cosine" },
-    });
-    console.log(`Created collection "${COLLECTION_NAME}" with vector size ${VECTOR_SIZE}`);
-    return true;
+    if (!exists) {
+      console.log(`⚠️ Collection "${COLLECTION_NAME}" not found. Creating...`);
+      await qdrant.createCollection(COLLECTION_NAME, {
+        vectors: { size: VECTOR_SIZE, distance: "Cosine" },
+      });
+      console.log(`✅ Collection "${COLLECTION_NAME}" created.`);
+    }
   } catch (err) {
-    console.error("Failed to create collection:", err.message);
-    return false;
+    console.error("❌ Failed to check/create collection:", err.message);
   }
 }
 
 /**
- * Main ingestion function
+ * Reset collection (delete + recreate)
+ */
+async function resetCollection() {
+  try {
+    await qdrant.deleteCollection(COLLECTION_NAME);
+    console.log(`🗑️ Deleted old collection "${COLLECTION_NAME}"`);
+  } catch (err) {
+    if (!err.message.includes("not found")) {
+      console.error("⚠️ Failed to delete collection:", err.message);
+    }
+  }
+  await ensureCollection();
+}
+
+/**
+ * Ingest RSS articles
  */
 export async function ingest() {
-  const success = await resetCollection();
-  if (!success) return;
+  await resetCollection();
 
-  // Fetch RSS feeds
   const feeds = [
     "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
     "https://www.theguardian.com/world/rss",
@@ -105,27 +119,18 @@ export async function ingest() {
       const feed = await parser.parseURL(url);
       articles.push(...feed.items.slice(0, 20));
     } catch (err) {
-      console.error("Failed to fetch feed:", url, err.message);
+      console.error(`❌ Failed to fetch feed ${url}:`, err.message);
     }
   }
 
-  // Limit to 50 articles
   articles = articles.slice(0, 50);
-  console.log(`Processing ${articles.length} articles`);
+  console.log(`📥 Processing ${articles.length} articles`);
 
   for (const item of articles) {
     const text = item.contentSnippet || item.title || "No content";
-    console.log(`Processing article: ${item.title}`);
-
     try {
-      console.log("Embedding with Jina...");
       const vector = await embedWithJina(text);
-      if (!vector || vector.length !== VECTOR_SIZE) {
-        console.error(`Invalid vector size: ${vector?.length}`);
-        continue;
-      }
 
-      console.log("Upserting into Qdrant...");
       await qdrant.upsert(COLLECTION_NAME, {
         points: [
           {
@@ -140,11 +145,11 @@ export async function ingest() {
         ],
       });
 
-      console.log(`Inserted: ${item.title}`);
+      console.log(`✅ Inserted: ${item.title}`);
     } catch (err) {
-      console.error(`Failed article "${item.title}":`, err.message);
+      console.error(`⚠️ Failed article "${item.title}":`, err.message);
     }
   }
 
-  console.log(`Finished ingesting ${articles.length} articles`);
+  console.log(`🎉 Finished ingesting ${articles.length} articles`);
 }
